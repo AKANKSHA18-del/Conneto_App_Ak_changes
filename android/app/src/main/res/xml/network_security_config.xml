@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+    <!-- Allow Google OAuth domains -->
+    <domain-config cleartextTrafficPermitted="false">
+        <domain includeSubdomains="true">accounts.google.com</domain>
+        <domain includeSubdomains="true">oauth2.googleapis.com</domain>
+        <domain includeSubdomains="true">conneto-internship-portal.vercel.app</domain>
+    </domain-config>
+</network-security-config>
