@@ -34,12 +34,12 @@ void main() async {
 
 bool _isLoginPageUrl(String url) {
   final lower = url.toLowerCase();
-  return lower == '$_baseUrl/' ||
-      lower == _baseUrl ||
-      lower == '$_baseUrl' ||
-      lower.endsWith('vercel.app/') ||
-      lower.endsWith('vercel.app') ||
-      lower.contains('/login') ||
+  // Specifically avoid matching auth callbacks or internal API paths
+  if (lower.contains('/api/auth') || lower.contains('callback')) return false;
+  
+  // Root URL is often a landing page, not strictly a "login page"
+  // unless it contains explicit login paths.
+  return lower.contains('/login') ||
       lower.contains('/signin') ||
       lower.contains('/signup') ||
       lower.contains('/register');
@@ -84,8 +84,12 @@ class _WebViewScreenState extends State<WebViewScreen> {
 
   // ── URL helpers ─────────────────────────────────────────────
 
-  bool _isInternalUrl(String url) =>
-      url.contains('conneto-internship-portal.vercel.app');
+  bool _isInternalUrl(String url) {
+    final lower = url.toLowerCase();
+    return lower.contains('conneto-internship-portal.vercel.app') || 
+           lower.contains('conneto.in') ||
+           lower.contains('conneto.com');
+  }
 
   bool _isDashboardUrl(String url) =>
       url.contains('/student/dashboard') ||
@@ -95,18 +99,24 @@ class _WebViewScreenState extends State<WebViewScreen> {
 
   bool _isLoginPageUrl(String url) {
     final lower = url.toLowerCase();
-    return (lower.endsWith('vercel.app/') || lower == _baseUrl || lower == '$_baseUrl/') ||
-        lower.contains('/login') ||
+    // Exclude API and Auth callbacks from being treated as "login pages"
+    if (lower.contains('/api/auth') || lower.contains('callback')) return false;
+
+    // We only treat explicit /login, /signin etc as login pages.
+    // This allows the root landing page to be seen as "Home".
+    return lower.contains('/login') ||
         lower.contains('/signin') ||
         lower.contains('/signup') ||
-        lower.contains('/register') ||
-        lower.contains('/auth');
+        lower.contains('/register');
   }
 
   bool _isLogoutAction(String url) {
     final lower = url.toLowerCase();
-    // Only logout if it's a clear logout path, not a sub-page or query param success
-    return (lower.endsWith('/logout') || lower.endsWith('/signout')) && !lower.contains('success=');
+    return (lower.endsWith('/logout') || 
+            lower.endsWith('/signout') || 
+            lower.contains('logout=true') || 
+            lower.contains('/api/auth/signout')) && 
+           !lower.contains('success=');
   }
 
   bool _isFileUrl(String url) {
@@ -156,7 +166,11 @@ class _WebViewScreenState extends State<WebViewScreen> {
     final lower = url.toLowerCase();
     
     // Explicitly prevent these from EVER jumping to Chrome
-    if (lower.contains('vercel.app') || lower.contains('google.com') || lower.contains('accounts.google') || lower.contains('oauth')) return false;
+    if (lower.contains('vercel.app') || 
+        lower.contains('google.com') || 
+        lower.contains('accounts.google') || 
+        lower.contains('google.co') ||
+        lower.contains('oauth')) return false;
 
     // Only allow non-web intents to launch externally
     if (lower.startsWith('tel:') || lower.startsWith('mailto:') || lower.startsWith('whatsapp:')) {
@@ -292,7 +306,8 @@ class _WebViewScreenState extends State<WebViewScreen> {
 
     final ctrl = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
-      ..setUserAgent("Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36")
+      ..setUserAgent("Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36")
+      ..setBackgroundColor(const Color(0x00000000))
       ..setOnConsoleMessage((msg) => debugPrint('JS: ${msg.message}'))
 
       // ── Download channel ────────────────────────────────
@@ -330,6 +345,11 @@ class _WebViewScreenState extends State<WebViewScreen> {
 
       // ── Navigation delegate ─────────────────────────────
       ..setNavigationDelegate(NavigationDelegate(
+        onProgressChanged: (progress) {
+          if (progress > 80 && _isInitialLoad && mounted) {
+            setState(() => _isInitialLoad = false);
+          }
+        },
         onPageStarted: (url) {
           // Check for session markers in URL
           if (_isDashboardUrl(url)) {
@@ -354,12 +374,19 @@ class _WebViewScreenState extends State<WebViewScreen> {
           }
 
           // Force Google Account Chooser so users can select an account like a native app
-          // Only do this if it's the actual auth page and doesn't have a prompt already
           if (_isGoogleAuthUrl(url) && 
               (url.contains('oauth2/v2/auth') || url.contains('oauth2/auth')) && 
-              !url.contains('prompt=')) {
+              !url.contains('prompt=select_account')) {
+            
             String newUrl = url;
-            newUrl += (newUrl.contains('?') ? '&' : '?') + 'prompt=select_account';
+            if (newUrl.contains('prompt=')) {
+              // Replace existing prompt with select_account
+              newUrl = newUrl.replaceAll(RegExp(r'prompt=[^&]+'), 'prompt=select_account');
+            } else {
+              newUrl += (newUrl.contains('?') ? '&' : '?') + 'prompt=select_account';
+            }
+            
+            debugPrint('FORCING ACCOUNT PICKER: $newUrl');
             _controller?.loadRequest(Uri.parse(newUrl));
             return NavigationDecision.prevent;
           }
@@ -367,6 +394,14 @@ class _WebViewScreenState extends State<WebViewScreen> {
           if (_isLogoutAction(url)) {
             await _onUserLoggedOut();
             return NavigationDecision.navigate;
+          }
+
+          // Proactively redirect to dashboard if logged in and hitting a login page
+          final bool loggedIn = _prefs?.getBool(_prefKeyLoggedIn) ?? false;
+          if (loggedIn && _isLoginPageUrl(url)) {
+            debugPrint('NAV: Already logged in, skipping login page for dashboard.');
+            _controller?.loadRequest(Uri.parse(_dashboardUrl));
+            return NavigationDecision.prevent;
           }
 
           if (url.contains('error=You+have+already+submitted+a+diary+log')) {
@@ -407,13 +442,18 @@ class _WebViewScreenState extends State<WebViewScreen> {
             if (_isDashboardUrl(url)) {
               await _onUserLoggedIn(url);
             } else if (_isLoginPageUrl(url)) {
-              // If the app thinks we are logged in but we hit a login page,
-              // it means either the session expired OR we accidentally navigated there.
-              // We only redirect to dashboard if we are NOT in the middle of an explicit logout.
               if (loggedIn) {
-                debugPrint('SESSION: Logged in but hit login page. Attempting dashboard redirect.');
-                _controller?.loadRequest(Uri.parse(_dashboardUrl));
-                return;
+                final lastRedirect = _prefs?.getInt('last_dash_redirect') ?? 0;
+                final now = DateTime.now().millisecondsSinceEpoch;
+                if (now - lastRedirect < 5000) {
+                  debugPrint('SESSION: Redirect loop detected. Clearing session.');
+                  await _onUserLoggedOut();
+                } else {
+                  debugPrint('SESSION: Logged in but hit login page. Attempting auto-login.');
+                  await _prefs?.setInt('last_dash_redirect', now);
+                  _controller?.loadRequest(Uri.parse(_dashboardUrl));
+                  return;
+                }
               }
             } else {
               await _saveCurrentUrl(url);
@@ -627,12 +667,18 @@ class _WebViewScreenState extends State<WebViewScreen> {
 
     if (loggedIn) {
       if (_isDashboardUrl(_currentUrl)) {
-        return true; // Exit immediately on dashboard back
+        // If on dashboard, maybe try to go back to landing page if it exists in history
+        if (await ctrl.canGoBack()) {
+          await ctrl.goBack();
+          return false;
+        }
+        return true; // Exit if no more history
       } else {
         if (await ctrl.canGoBack()) {
           await ctrl.goBack();
           return false;
         }
+        // If no history, go to dashboard as home base
         await ctrl.loadRequest(Uri.parse(_dashboardUrl));
         return false;
       }
