@@ -345,11 +345,6 @@ class _WebViewScreenState extends State<WebViewScreen> {
 
       // ── Navigation delegate ─────────────────────────────
       ..setNavigationDelegate(NavigationDelegate(
-        onProgressChanged: (progress) {
-          if (progress > 80 && _isInitialLoad && mounted) {
-            setState(() => _isInitialLoad = false);
-          }
-        },
         onPageStarted: (url) {
           // Check for session markers in URL
           if (_isDashboardUrl(url)) {
