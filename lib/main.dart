@@ -1,3 +1,6 @@
+import 'dart:async';
+import 'dart:convert';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -14,22 +17,24 @@ const String _baseUrl = 'https://conneto-internship-portal.vercel.app';
 const String _dashboardUrl = '$_baseUrl/student/dashboard';
 const String _prefKeyUrl = 'last_url';
 const String _prefKeyLoggedIn = 'is_logged_in';
+const String _prefKeyCookieJar = 'cookie_jar_v2';
+const String _prefKeyWebStorage = 'web_storage_v2';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   
   final prefs = await SharedPreferences.getInstance();
   final loggedIn = prefs.getBool(_prefKeyLoggedIn) ?? false;
-  String startUrl;
+  final lastSavedUrl = prefs.getString(_prefKeyUrl);
+  String startUrl = loggedIn
+      ? _dashboardLandingUrlFor(lastSavedUrl)
+      : '$_baseUrl/';
 
-  if (loggedIn) {
-    startUrl = prefs.getString(_prefKeyUrl) ?? _dashboardUrl;
-    if (_isLoginPageUrl(startUrl)) startUrl = _dashboardUrl;
-  } else {
-    startUrl = '$_baseUrl/';
+  if (_isLoginPageUrl(startUrl)) {
+    startUrl = loggedIn ? _dashboardLandingUrlFor(lastSavedUrl) : '$_baseUrl/';
   }
 
-  runApp(MyApp(startUrl: startUrl));
+  runApp(MyApp(startUrl: startUrl, prefs: prefs));
 }
 
 bool _isLoginPageUrl(String url) {
@@ -45,17 +50,37 @@ bool _isLoginPageUrl(String url) {
       lower.contains('/register');
 }
 
+String _dashboardLandingUrlFor(String? url) {
+  final lower = url?.toLowerCase() ?? '';
+
+  if (lower.contains('/company/')) {
+    return '$_baseUrl/company/dashboard';
+  }
+  if (lower.contains('/mentor/')) {
+    return '$_baseUrl/mentor/dashboard';
+  }
+  if (lower.contains('/admin/')) {
+    return '$_baseUrl/admin/dashboard';
+  }
+
+  return _dashboardUrl;
+}
+
 class MyApp extends StatelessWidget {
   final String startUrl;
-  const MyApp({super.key, required this.startUrl});
+  final SharedPreferences prefs;
+  const MyApp({super.key, required this.startUrl, required this.prefs});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Conneto Internship Portal',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(colorSchemeSeed: Colors.blue),
-      home: WebViewScreen(startUrl: startUrl),
+      theme: ThemeData(
+        colorSchemeSeed: Colors.blue,
+        useMaterial3: true,
+      ),
+      home: WebViewScreen(startUrl: startUrl, prefs: prefs),
     );
   }
 }
@@ -67,20 +92,34 @@ class MyApp extends StatelessWidget {
 // ─────────────────────────────────────────────────────────────
 class WebViewScreen extends StatefulWidget {
   final String startUrl;
-  const WebViewScreen({super.key, required this.startUrl});
+  final SharedPreferences prefs;
+  const WebViewScreen({super.key, required this.startUrl, required this.prefs});
 
   @override
   State<WebViewScreen> createState() => _WebViewScreenState();
 }
 
-class _WebViewScreenState extends State<WebViewScreen> {
+class _WebViewScreenState extends State<WebViewScreen>
+    with WidgetsBindingObserver {
+  static const MethodChannel _sessionChannel = MethodChannel(
+    'conneto/session',
+  );
   WebViewController? _controller;
   SharedPreferences? _prefs;
+  final WebViewCookieManager _cookieManager = WebViewCookieManager();
 
   final Map<String, DateTime> _recentNavigations = {};
+  final Set<String> _restoredStorageHosts = <String>{};
   bool _handlingDiaryRedirect = false;
   bool _isInitialLoad = true;
   String _currentUrl = '';
+  Timer? _initialLoadGuardTimer;
+  // Use a stable Chrome-on-Android UA so auth pages behave like a normal
+  // Android browser instead of the default WebView identity.
+  final String _permanentUA =
+      "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) "
+      "AppleWebKit/537.36 (KHTML, like Gecko) "
+      "Chrome/125.0.0.0 Mobile Safari/537.36";
 
   // ── URL helpers ─────────────────────────────────────────────
 
@@ -91,19 +130,38 @@ class _WebViewScreenState extends State<WebViewScreen> {
            lower.contains('conneto.com');
   }
 
-  bool _isDashboardUrl(String url) =>
-      url.contains('/student/dashboard') ||
-      url.contains('/mentor/dashboard') ||
-      url.contains('/admin/dashboard') ||
-      url.contains('/dashboard') && !url.contains('/login');
+  bool _isDashboardUrl(String url) {
+    if (!_isInternalUrl(url)) return false;
+    final lower = url.toLowerCase();
+    
+    // Explicitly logged in if on dashboard or callback/success pages
+    if (lower.contains('/dashboard') || 
+        lower.contains('/api/auth/callback') || 
+        lower.contains('success=true') ||
+        lower.contains('/auth/success')) {
+      return true;
+    }
+    
+    // Also logged in if on protected student/company/mentor/admin paths
+    if (lower.contains('/student/') ||
+        lower.contains('/company/') ||
+        lower.contains('/mentor/') ||
+        lower.contains('/admin/')) {
+       // But not if it's just a login/signup path
+       if (!lower.contains('/login') && !lower.contains('/signup') && !lower.contains('/register')) {
+         return true;
+       }
+    }
+    
+    return false;
+  }
 
   bool _isLoginPageUrl(String url) {
+    if (!_isInternalUrl(url)) return false;
     final lower = url.toLowerCase();
-    // Exclude API and Auth callbacks from being treated as "login pages"
+    // Exclude API and Auth callbacks
     if (lower.contains('/api/auth') || lower.contains('callback')) return false;
 
-    // We only treat explicit /login, /signin etc as login pages.
-    // This allows the root landing page to be seen as "Home".
     return lower.contains('/login') ||
         lower.contains('/signin') ||
         lower.contains('/signup') ||
@@ -111,6 +169,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
   }
 
   bool _isLogoutAction(String url) {
+    if (!_isInternalUrl(url)) return false;
     final lower = url.toLowerCase();
     return (lower.endsWith('/logout') || 
             lower.endsWith('/signout') || 
@@ -188,6 +247,8 @@ class _WebViewScreenState extends State<WebViewScreen> {
   }
 
   bool _isDuplicateNavigation(String url) {
+    if (_isAuthFlowUrl(url)) return false;
+
     final now = DateTime.now();
     final last = _recentNavigations[url];
     if (last != null && now.difference(last).inMilliseconds < 1000) return true;
@@ -195,13 +256,93 @@ class _WebViewScreenState extends State<WebViewScreen> {
     return false;
   }
 
+  bool _isAuthFlowUrl(String url) {
+    final lower = url.toLowerCase();
+    return _isGoogleAuthUrl(url) ||
+        lower.contains('/api/auth') ||
+        lower.contains('callback') ||
+        lower.contains('/login') ||
+        lower.contains('/signin') ||
+        lower.contains('/signup') ||
+        lower.contains('/register');
+  }
+
+  bool _shouldPersistWebState(String url) {
+    return _isInternalUrl(url);
+  }
+
+  String? _hostForUrl(String url) {
+    final uri = Uri.tryParse(url);
+    final host = uri?.host.toLowerCase();
+    if (host == null || host.isEmpty) return null;
+    return host;
+  }
+
+  Map<String, dynamic> _decodeJsonObject(String? raw) {
+    if (raw == null || raw.isEmpty) return <String, dynamic>{};
+
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is Map<String, dynamic>) return decoded;
+      if (decoded is Map) {
+        return decoded.map(
+          (key, value) => MapEntry(key.toString(), value),
+        );
+      }
+    } catch (_) {
+      // Ignore invalid persisted data and fall back to an empty object.
+    }
+
+    return <String, dynamic>{};
+  }
+
+  String _normalizeJavaScriptResult(Object result) {
+    final text = result.toString();
+    if (text == 'null' || text == 'undefined') return '';
+
+    try {
+      final decoded = jsonDecode(text);
+      if (decoded is String) return decoded;
+      return jsonEncode(decoded);
+    } catch (_) {
+      return text;
+    }
+  }
+
+  Map<String, String> _parseCookieString(String cookieString) {
+    final cookies = <String, String>{};
+
+    for (final segment in cookieString.split(';')) {
+      final item = segment.trim();
+      if (item.isEmpty) continue;
+
+      final separatorIndex = item.indexOf('=');
+      if (separatorIndex <= 0) continue;
+
+      final name = item.substring(0, separatorIndex).trim();
+      final value = item.substring(separatorIndex + 1).trim();
+      if (name.isEmpty) continue;
+
+      cookies[name] = value;
+    }
+
+    return cookies;
+  }
+
+  bool _isConnetoHost(String host) {
+    final lower = host.toLowerCase();
+    return lower.contains('conneto-internship-portal.vercel.app') ||
+        lower.contains('conneto.in') ||
+        lower.contains('conneto.com');
+  }
+
   // ── Session ─────────────────────────────────────────────────
 
   Future<void> _onUserLoggedIn(String url) async {
     if (_isLoginPageUrl(url)) return; 
     await _prefs?.setBool(_prefKeyLoggedIn, true);
-    if (_isInternalUrl(url)) {
-      await _prefs?.setString(_prefKeyUrl, url);
+    if (_isInternalUrl(url) && !_isAuthFlowUrl(url)) {
+      await _prefs?.setString(_prefKeyUrl, _dashboardLandingUrlFor(url));
     }
     debugPrint('SESSION: Active - $url');
   }
@@ -209,17 +350,222 @@ class _WebViewScreenState extends State<WebViewScreen> {
   Future<void> _onUserLoggedOut() async {
     await _prefs?.setBool(_prefKeyLoggedIn, false);
     await _prefs?.remove(_prefKeyUrl);
+    await _clearPersistedAppSessionState();
+    // Note: We no longer clear cookies here. This allows Google to "store" 
+    // accounts so the user can "choose different account" or "use another" 
+    // easily, while still being logged out of the Conneto app session.
     debugPrint('SESSION: Logged Out');
   }
 
   Future<void> _saveCurrentUrl(String url) async {
     if (_isInternalUrl(url) && !_isLoginPageUrl(url)) {
-      await _prefs?.setString(_prefKeyUrl, url);
+      await _prefs?.setString(_prefKeyUrl, _dashboardLandingUrlFor(url));
       // Auto-set logged in if we are on a dashboard
       if (_isDashboardUrl(url)) {
         final loggedIn = _prefs?.getBool(_prefKeyLoggedIn) ?? false;
         if (!loggedIn) await _onUserLoggedIn(url);
       }
+    }
+  }
+
+  Future<void> _restorePersistedCookies() async {
+    final prefs = _prefs;
+    if (prefs == null) return;
+
+    final savedCookieJar = _decodeJsonObject(prefs.getString(_prefKeyCookieJar));
+
+    for (final entry in savedCookieJar.entries) {
+      if (entry.value is! Map) continue;
+
+      final host = entry.key.trim();
+      if (host.isEmpty || !_isConnetoHost(host)) continue;
+
+      final cookies = Map<String, dynamic>.from(entry.value as Map);
+      for (final cookieEntry in cookies.entries) {
+        final name = cookieEntry.key.trim();
+        final value = cookieEntry.value?.toString() ?? '';
+        if (name.isEmpty) continue;
+
+        try {
+          await _cookieManager.setCookie(
+            WebViewCookie(
+              name: name,
+              value: value,
+              domain: host,
+            ),
+          );
+        } catch (e) {
+          debugPrint('COOKIE RESTORE ERROR [$host/$name]: $e');
+        }
+      }
+    }
+  }
+
+  Future<void> _clearPersistedAppSessionState() async {
+    final prefs = _prefs;
+    if (prefs == null) return;
+
+    final savedCookieJar = _decodeJsonObject(prefs.getString(_prefKeyCookieJar));
+    savedCookieJar.removeWhere(
+      (host, _) => _isConnetoHost(host),
+    );
+    await prefs.setString(_prefKeyCookieJar, jsonEncode(savedCookieJar));
+
+    final savedStorage = _decodeJsonObject(prefs.getString(_prefKeyWebStorage));
+    savedStorage.removeWhere(
+      (host, _) => _isConnetoHost(host),
+    );
+    await prefs.setString(_prefKeyWebStorage, jsonEncode(savedStorage));
+  }
+
+  Future<bool> _restorePersistedWebStorage(String url) async {
+    final ctrl = _controller;
+    final prefs = _prefs;
+    final host = _hostForUrl(url);
+
+    if (ctrl == null ||
+        prefs == null ||
+        host == null ||
+        !_shouldPersistWebState(url) ||
+        _restoredStorageHosts.contains(host)) {
+      return false;
+    }
+
+    _restoredStorageHosts.add(host);
+
+    final savedStorage = _decodeJsonObject(prefs.getString(_prefKeyWebStorage));
+    final rawHostState = savedStorage[host];
+    if (rawHostState is! Map) return false;
+
+    final hostState = Map<String, dynamic>.from(rawHostState);
+    final localStorageState = hostState['localStorage'] is Map
+        ? Map<String, dynamic>.from(hostState['localStorage'] as Map)
+        : <String, dynamic>{};
+
+    if (localStorageState.isEmpty) {
+      return false;
+    }
+
+    final payload = jsonEncode(<String, dynamic>{
+      'localStorage': localStorageState,
+    });
+
+    try {
+      final rawResult = await ctrl.runJavaScriptReturningResult('''
+        (function() {
+          try {
+            var payload = $payload;
+            var changed = false;
+
+            function applyStore(store, values) {
+              var keys = Object.keys(values || {});
+              for (var i = 0; i < keys.length; i++) {
+                var key = keys[i];
+                var value = values[key];
+                if (store.getItem(key) !== value) {
+                  if (value === null || value === undefined) {
+                    store.removeItem(key);
+                  } else {
+                    store.setItem(key, value);
+                  }
+                  changed = true;
+                }
+              }
+            }
+
+            applyStore(localStorage, payload.localStorage);
+
+            return JSON.stringify({ changed: changed });
+          } catch (e) {
+            return JSON.stringify({ changed: false, error: String(e) });
+          }
+        })();
+      ''');
+
+      final result = _decodeJsonObject(_normalizeJavaScriptResult(rawResult));
+      return result['changed'] == true;
+    } catch (e) {
+      debugPrint('WEB STORAGE RESTORE ERROR [$host]: $e');
+      return false;
+    }
+  }
+
+  Future<void> _persistWebSnapshot(String url) async {
+    final ctrl = _controller;
+    final prefs = _prefs;
+    final host = _hostForUrl(url);
+
+    if (ctrl == null ||
+        prefs == null ||
+        host == null ||
+        !_shouldPersistWebState(url)) {
+      return;
+    }
+
+    try {
+      final rawSnapshot = await ctrl.runJavaScriptReturningResult('''
+        (function() {
+          try {
+            var snapshot = {
+              cookie: document.cookie || '',
+              localStorage: {}
+            };
+
+            for (var i = 0; i < localStorage.length; i++) {
+              var localKey = localStorage.key(i);
+              snapshot.localStorage[localKey] = localStorage.getItem(localKey);
+            }
+
+            return JSON.stringify(snapshot);
+          } catch (e) {
+            return JSON.stringify({
+              cookie: '',
+              localStorage: {},
+              error: String(e)
+            });
+          }
+        })();
+      ''');
+
+      final snapshot =
+          _decodeJsonObject(_normalizeJavaScriptResult(rawSnapshot));
+
+      final cookies = _parseCookieString(snapshot['cookie']?.toString() ?? '');
+      final savedCookieJar =
+          _decodeJsonObject(prefs.getString(_prefKeyCookieJar));
+      if (cookies.isNotEmpty) {
+        savedCookieJar[host] = cookies;
+      } else {
+        savedCookieJar.remove(host);
+      }
+      await prefs.setString(_prefKeyCookieJar, jsonEncode(savedCookieJar));
+
+      final localStorageState = snapshot['localStorage'] is Map
+          ? Map<String, dynamic>.from(snapshot['localStorage'] as Map)
+          : <String, dynamic>{};
+
+      final savedStorage =
+          _decodeJsonObject(prefs.getString(_prefKeyWebStorage));
+      if (localStorageState.isNotEmpty) {
+        savedStorage[host] = <String, dynamic>{
+          'localStorage': localStorageState,
+        };
+      } else {
+        savedStorage.remove(host);
+      }
+      await prefs.setString(_prefKeyWebStorage, jsonEncode(savedStorage));
+    } catch (e) {
+      debugPrint('WEB SNAPSHOT SAVE ERROR [$host]: $e');
+    }
+  }
+
+  Future<void> _flushNativeCookies() async {
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return;
+
+    try {
+      await _sessionChannel.invokeMethod('flushCookies');
+    } catch (e) {
+      debugPrint('COOKIE FLUSH ERROR: $e');
     }
   }
 
@@ -294,19 +640,43 @@ class _WebViewScreenState extends State<WebViewScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _currentUrl = widget.startUrl;
+    _initialLoadGuardTimer = Timer(const Duration(milliseconds: 1800), () {
+      if (mounted && _isInitialLoad) {
+        setState(() {
+          _isInitialLoad = false;
+        });
+      }
+    });
     _setupWebView();
   }
 
+  @override
+  void dispose() {
+    _initialLoadGuardTimer?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached) {
+      if (_currentUrl.isNotEmpty) {
+        _persistWebSnapshot(_currentUrl);
+      }
+      _flushNativeCookies();
+    }
+  }
+
   Future<void> _setupWebView() async {
-    _prefs = await SharedPreferences.getInstance();
-    
-    // Cookies are persistent by default in this version
-    final cookieManager = WebViewCookieManager();
+    _prefs = widget.prefs;
 
     final ctrl = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
-      ..setUserAgent("Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36")
+      ..setUserAgent(_permanentUA)
       ..setBackgroundColor(const Color(0x00000000))
       ..setOnConsoleMessage((msg) => debugPrint('JS: ${msg.message}'))
 
@@ -345,12 +715,21 @@ class _WebViewScreenState extends State<WebViewScreen> {
 
       // ── Navigation delegate ─────────────────────────────
       ..setNavigationDelegate(NavigationDelegate(
+        onProgress: (progress) {
+          if (progress > 35 && _isInitialLoad) {
+            if (mounted) {
+              setState(() {
+                _isInitialLoad = false;
+              });
+            }
+          }
+        },
         onPageStarted: (url) {
+          _currentUrl = url;
+
           // Check for session markers in URL
           if (_isDashboardUrl(url)) {
             _onUserLoggedIn(url);
-          } else if (_isLogoutAction(url)) {
-            _onUserLoggedOut();
           }
         },
 
@@ -368,7 +747,8 @@ class _WebViewScreenState extends State<WebViewScreen> {
             return NavigationDecision.prevent;
           }
 
-          // Force Google Account Chooser so users can select an account like a native app
+          // Keep Google auth inside the WebView, but normalize the account picker
+          // so repeat sign-in/sign-up attempts behave consistently.
           if (_isGoogleAuthUrl(url) && 
               (url.contains('oauth2/v2/auth') || url.contains('oauth2/auth')) && 
               !url.contains('prompt=select_account')) {
@@ -382,22 +762,15 @@ class _WebViewScreenState extends State<WebViewScreen> {
             }
             
             debugPrint('FORCING ACCOUNT PICKER: $newUrl');
-            _controller?.loadRequest(Uri.parse(newUrl));
+            await _controller?.loadRequest(Uri.parse(newUrl));
             return NavigationDecision.prevent;
           }
 
           if (_isLogoutAction(url)) {
-            await _onUserLoggedOut();
             return NavigationDecision.navigate;
           }
 
-          // Proactively redirect to dashboard if logged in and hitting a login page
-          final bool loggedIn = _prefs?.getBool(_prefKeyLoggedIn) ?? false;
-          if (loggedIn && _isLoginPageUrl(url)) {
-            debugPrint('NAV: Already logged in, skipping login page for dashboard.');
-            _controller?.loadRequest(Uri.parse(_dashboardUrl));
-            return NavigationDecision.prevent;
-          }
+          // Keep a stable Chrome-on-Android identity for auth-related pages.
 
           if (url.contains('error=You+have+already+submitted+a+diary+log')) {
             _handleDiaryRedirect(url, isDuplicate: true);
@@ -429,6 +802,14 @@ class _WebViewScreenState extends State<WebViewScreen> {
             });
           }
           debugPrint('LOADED: $url');
+          _initialLoadGuardTimer?.cancel();
+
+          final restoredStorage = await _restorePersistedWebStorage(url);
+          if (restoredStorage) {
+            debugPrint('SESSION: Restored web storage for $url, reloading once.');
+            await _controller?.reload();
+            return;
+          }
 
           // Session persistence logic
           final bool loggedIn = _prefs?.getBool(_prefKeyLoggedIn) ?? false;
@@ -437,19 +818,10 @@ class _WebViewScreenState extends State<WebViewScreen> {
             if (_isDashboardUrl(url)) {
               await _onUserLoggedIn(url);
             } else if (_isLoginPageUrl(url)) {
-              if (loggedIn) {
-                final lastRedirect = _prefs?.getInt('last_dash_redirect') ?? 0;
-                final now = DateTime.now().millisecondsSinceEpoch;
-                if (now - lastRedirect < 5000) {
-                  debugPrint('SESSION: Redirect loop detected. Clearing session.');
-                  await _onUserLoggedOut();
-                } else {
-                  debugPrint('SESSION: Logged in but hit login page. Attempting auto-login.');
-                  await _prefs?.setInt('last_dash_redirect', now);
-                  _controller?.loadRequest(Uri.parse(_dashboardUrl));
-                  return;
-                }
-              }
+              // If we are on a login page but the app thinks we are logged in,
+              // we don't force a logout anymore. We just let the user log in again.
+              // This satisfies the "no logout on restart/shutdown" requirement.
+              debugPrint('SESSION: On login page. App state: ${loggedIn ? "Logged In" : "Logged Out"}');
             } else {
               await _saveCurrentUrl(url);
             }
@@ -476,9 +848,12 @@ class _WebViewScreenState extends State<WebViewScreen> {
           // Inject JS
           await _injectSessionDetection(url);
           _injectJsBridge();
+          await _persistWebSnapshot(url);
+          await _flushNativeCookies();
         },
 
         onWebResourceError: (error) {
+          _initialLoadGuardTimer?.cancel();
           if (mounted) setState(() => _isInitialLoad = false);
           debugPrint('WEB ERR: ${error.description}');
         },
@@ -489,11 +864,14 @@ class _WebViewScreenState extends State<WebViewScreen> {
     if (ctrl.platform is AndroidWebViewController) {
       final android = ctrl.platform as AndroidWebViewController;
       android.setOnShowFileSelector(_handleFileSelection);
+      
       // Ensure third-party cookies are allowed for Google Sign-In persistence
-      final androidCookieManager = WebViewCookieManager().platform as AndroidWebViewCookieManager;
+      final androidCookieManager =
+          _cookieManager.platform as AndroidWebViewCookieManager;
       androidCookieManager.setAcceptThirdPartyCookies(android, true);
     }
 
+    await _restorePersistedCookies();
     await ctrl.loadRequest(Uri.parse(widget.startUrl));
     if (mounted) setState(() {});
   }
@@ -508,9 +886,26 @@ class _WebViewScreenState extends State<WebViewScreen> {
           "FlutterSession.postMessage('login:${url.replaceAll("'", "\\'")}');");
     }
 
-    // Logout button detection - more specific to avoid accidental triggers
+    // Keep the website's own long-session option enabled for email/password
+    // logins, and only treat explicit logout actions as app logout.
     await _controller?.runJavaScript(r'''
       (function() {
+        if (location.pathname === '/auth/login') {
+          var remember = document.querySelector('input[name="remember"]');
+          if (remember && !remember.checked) {
+            remember.checked = true;
+            remember.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        }
+
+        var hasAuthenticatedUi =
+          !!document.querySelector('a[href*="/logout"], a[href*="/signout"], form[action*="/logout"], form[action*="/signout"]') ||
+          !!document.querySelector('a[href*="/student/dashboard"], a[href*="/company/dashboard"], a[href*="/mentor/dashboard"], a[href*="/admin/dashboard"]');
+
+        if (hasAuthenticatedUi && location.pathname.indexOf('/auth/') === -1) {
+          FlutterSession.postMessage('login:' + location.href);
+        }
+
         if (window.__logoutListenerAdded) return;
         window.__logoutListenerAdded = true;
         document.addEventListener('click', function(e) {
@@ -526,6 +921,22 @@ class _WebViewScreenState extends State<WebViewScreen> {
           
           if (isLogoutText || isLogoutHref) {
             console.log('Logout detected via JS bridge');
+            FlutterSession.postMessage('logout');
+          }
+        }, true);
+
+        document.addEventListener('submit', function(e) {
+          var form = e.target;
+          if (!form || !form.action) return;
+
+          var action = String(form.action).toLowerCase();
+          var isLogoutForm =
+            action.indexOf('/logout') !== -1 ||
+            action.indexOf('/signout') !== -1 ||
+            action.indexOf('logout=true') !== -1;
+
+          if (isLogoutForm) {
+            console.log('Logout form detected via JS bridge');
             FlutterSession.postMessage('logout');
           }
         }, true);
@@ -577,15 +988,84 @@ class _WebViewScreenState extends State<WebViewScreen> {
           }
         }, true);
 
+        // BROWSER DECEPTION: Shims to satisfy Google's security checks
+        (function() {
+          // Shim window.chrome which Google's security library checks for
+          window.chrome = {
+            runtime: {},
+            loadTimes: function() { return {}; },
+            csi: function() { return {}; },
+            app: {}
+          };
+          
+          // Override navigator.userAgent in JS to match the controller
+          Object.defineProperty(navigator, 'userAgent', {
+            get: function () { return 'Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36'; }
+          });
+          
+          // Shim navigator.platform to look like Chrome on Android
+          Object.defineProperty(navigator, 'platform', {
+            get: function () { return 'Linux armv8l'; }
+          });
+          
+          // Force Google Identity Services (GSI) to use redirect mode instead of popup
+          var _origProp = Object.defineProperty;
+          Object.defineProperty = function(obj, prop, descriptor) {
+            if (prop === 'ux_mode' && descriptor) {
+              descriptor.value = 'redirect';
+              console.log('Forced GSI ux_mode to redirect');
+            }
+            return _origProp.apply(this, arguments);
+          };
+        })();
+
         // Google OAuth popup → redirect in same tab
         window.open = function(url, target, features) {
           if (url && url !== 'about:blank') {
-            // Force EVERYTHING from window.open to load in the current webview
-            // NavigationDelegate in Flutter will catch actual files/downloads
+            console.log('Intercepted window.open: ' + url);
             window.location.href = url;
           }
-          return null;
+          var win = {
+            closed: false,
+            name: target || 'google_auth_window',
+            opener: window,
+            close: function() { console.log('Popup close requested'); },
+            focus: function() { console.log('Popup focus requested'); },
+            postMessage: function(msg) { console.log('Popup postMessage: ' + msg); }
+          };
+          win.window = win;
+          return win;
         };
+
+        // MutationObserver to fix Google Sign-In buttons dynamically
+        var authObserver = new MutationObserver(function(mutations) {
+          mutations.forEach(function(mutation) {
+            if (mutation.addedNodes) {
+              mutation.addedNodes.forEach(function(node) {
+                if (node.nodeType === 1) {
+                  if (node.hasAttribute('data-ux_mode')) {
+                    node.setAttribute('data-ux_mode', 'redirect');
+                  }
+                  var gbtns = node.querySelectorAll('[data-ux_mode="popup"]');
+                  for (var i = 0; i < gbtns.length; i++) {
+                    gbtns[i].setAttribute('data-ux_mode', 'redirect');
+                  }
+                }
+              });
+            }
+          });
+        });
+
+        function fixGAuthButtons() {
+          var gbtns = document.querySelectorAll('[data-ux_mode="popup"]');
+          for (var i = 0; i < gbtns.length; i++) {
+            gbtns[i].setAttribute('data-ux_mode', 'redirect');
+          }
+        }
+
+        // Run once immediately and then observe for dynamic changes
+        fixGAuthButtons();
+        authObserver.observe(document.body, { childList: true, subtree: true });
 
         // Force all _blank links to open in the same window
         document.addEventListener('click', function(e) {
@@ -659,15 +1139,14 @@ class _WebViewScreenState extends State<WebViewScreen> {
     if (ctrl == null) return true;
 
     final loggedIn = _prefs?.getBool(_prefKeyLoggedIn) ?? false;
+    final treatAsAuthenticated =
+        loggedIn &&
+        !_isLoginPageUrl(_currentUrl) &&
+        !_isAuthFlowUrl(_currentUrl);
 
-    if (loggedIn) {
+    if (treatAsAuthenticated) {
       if (_isDashboardUrl(_currentUrl)) {
-        // If on dashboard, maybe try to go back to landing page if it exists in history
-        if (await ctrl.canGoBack()) {
-          await ctrl.goBack();
-          return false;
-        }
-        return true; // Exit if no more history
+        return true;
       } else {
         if (await ctrl.canGoBack()) {
           await ctrl.goBack();
